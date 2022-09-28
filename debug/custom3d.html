@@ -24,8 +24,9 @@ var map = window.map = new mapboxgl.Map({
     center: [-9.4, -26.8],
     bearing: 131,
     pitch: 60,
-    style: 'mapbox://styles/mapbox/light-v9',
-    hash: true
+    style: 'mapbox://styles/mapbox/light-v10',
+    hash: true,
+    antialias: true
 });
 
 class Custom {
@@ -56,6 +57,7 @@ class Custom {
         const vertexShader = gl.createShader(gl.VERTEX_SHADER);
         gl.shaderSource(vertexShader, vertexSource);
         gl.compileShader(vertexShader);
+
         const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
         gl.shaderSource(fragmentShader, fragmentSource);
         gl.compileShader(fragmentShader);
@@ -100,7 +102,7 @@ class Custom {
         gl.useProgram(this.program);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
-        gl.enableVertexAttribArray(this.program.a_pos);
+        gl.enableVertexAttribArray(this.program.aPos);
         gl.vertexAttribPointer(this.program.aPos, 3, gl.FLOAT, false, 0, 0);
         gl.uniformMatrix4fv(this.program.uMatrix, false, matrix);
         gl.drawElements(gl.TRIANGLES, 12, gl.UNSIGNED_SHORT, 0);
@@ -108,6 +110,30 @@ class Custom {
 }
 
 map.on('load', function() {
+    map.addLayer({
+        "id": '3d-buildings',
+        "source": "composite",
+        "source-layer": "building",
+        "filter": ["==", "extrude", "true"],
+        "type": "fill-extrusion",
+        "minzoom": 11,
+        "paint": {
+            "fill-extrusion-color": "#aaa",
+            "fill-extrusion-height": ["interpolate", ["linear"], ["zoom"], 12, 0, 14, ["get", "height"]],
+            "fill-extrusion-base": ["interpolate", ["linear"], ["zoom"], 12, 0, 14, ["get", "min_height"]],
+            "fill-extrusion-opacity": ["interpolate", ["linear"], ["zoom"], 12, 0, 13, 0.25]
+        }
+    });
+    map.addLayer({
+        "id": "sky",
+        "type": "sky",
+        "paint": {
+            "sky-type": "atmosphere",
+            "sky-atmosphere-sun-intensity": 15,
+            "sky-atmosphere-color": "rgb(179,186,186)",
+            "sky-opacity-transition": {"duration": 3000}
+        }
+    });
     map.addLayer(new Custom());
 });
 

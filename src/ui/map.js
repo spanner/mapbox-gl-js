@@ -2922,7 +2922,8 @@ class Map extends Camera {
             antialias: this._antialias || false
         });
 
-        const gl = this._canvas.getContext('webgl', attributes) ||
+        const gl = this._canvas.getContext('webgl2', attributes) ||
+            this._canvas.getContext('webgl', attributes) ||
             this._canvas.getContext('experimental-webgl', attributes);
 
         if (!gl) {
