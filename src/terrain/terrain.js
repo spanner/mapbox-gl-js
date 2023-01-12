@@ -260,7 +260,8 @@ export class Terrain extends Elevation {
         this._sourceTilesOverlap = {};
         this.proxySourceCache = new ProxySourceCache(style.map);
         this.orthoMatrix = mat4.create();
-        mat4.ortho(this.orthoMatrix, 0, EXTENT, 0, EXTENT, 0, 1);
+        const epsilon = this.painter.transform.projection.name === 'globe' ?  .015 : 0; // Experimentally the smallest value to avoid rendering artifacts (https://github.com/mapbox/mapbox-gl-js/issues/11975)
+        mat4.ortho(this.orthoMatrix, epsilon, EXTENT, 0, EXTENT, 0, 1);
         const gl = context.gl;
         this._overlapStencilMode = new StencilMode({func: gl.GEQUAL, mask: 0xFF}, 0, 0xFF, gl.KEEP, gl.KEEP, gl.REPLACE);
         this._previousZoom = painter.transform.zoom;
@@ -284,9 +285,8 @@ export class Terrain extends Elevation {
      * Validate terrain and update source cache used for elevation.
      * Explicitly pass transform to update elevation (Transform.updateElevation)
      * before using transform for source cache update.
-     * cameraChanging is true when camera is zooming, panning or orbiting.
      */
-    update(style: Style, transform: Transform, cameraChanging: boolean) {
+    update(style: Style, transform: Transform, adaptCameraAltitude: boolean) {
         if (style && style.terrain) {
             if (this._style !== style) {
                 this.style = style;
@@ -323,9 +323,9 @@ export class Terrain extends Elevation {
             }
 
             updateSourceCache();
-            // Camera, when changing, gets constrained over terrain. Issue constrainCameraOverTerrain = true
-            // here to cover potential under terrain situation on data or style change.
-            transform.updateElevation(!cameraChanging);
+            // Camera gets constrained over terrain. Issue constrainCameraOverTerrain = true
+            // here to cover potential under terrain situation on data, style, or other camera changes.
+            transform.updateElevation(true, adaptCameraAltitude);
 
             // Reset tile lookup cache and update draped tiles coordinates.
             this.resetTileLookupCache(this.proxySourceCache.id);
@@ -395,6 +395,10 @@ export class Terrain extends Elevation {
     // Implements Elevation::_source.
     _source(): ?SourceCache {
         return this.enabled ? this.sourceCache : null;
+    }
+
+    isUsingMockSource(): boolean {
+        return this.sourceCache === this._mockSourceCache;
     }
 
     // Implements Elevation::exaggeration.
@@ -926,15 +930,12 @@ export class Terrain extends Elevation {
             }
         }
 
-        const fadingOrTransitioning = id => {
+        const isTransitioning = id => {
             const layer = this._style._layers[id];
             const isHidden = layer.isHidden(this.painter.transform.zoom);
-            const crossFade = layer.getCrossfadeParameters();
-            const isFading = !!crossFade && crossFade.t !== 1;
-            const isTransitioning = layer.hasTransition();
-            return layer.type !== 'custom' && !isHidden && (isFading || isTransitioning);
+            return layer.type !== 'custom' && !isHidden && layer.hasTransition();
         };
-        return this._style.order.some(fadingOrTransitioning);
+        return this._style.order.some(isTransitioning);
     }
 
     _clearRasterFadeFromRenderCache() {

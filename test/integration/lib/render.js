@@ -4,7 +4,10 @@
 // render-fixtures.json is automatically generated before this file gets built
 // refer testem.js#before_tests()
 import fixtures from '../dist/render-fixtures.json';
-import ignores from '../../ignores.json';
+import ignores from '../../ignores/all.js';
+import ignoreWindows from '../../ignores/windows.js';
+import ignoreMac from '../../ignores/macos.js';
+import ignoreFirefox from '../../ignores/firefox.js';
 import config from '../../../src/util/config.js';
 import {clamp} from '../../../src/util/util.js';
 import {mercatorZfromAltitude} from '../../../src/geo/mercator_coordinate.js';
@@ -27,6 +30,7 @@ const container = document.createElement('div');
 container.style.position = 'fixed';
 container.style.bottom = '10px';
 container.style.right = '10px';
+container.style.background = 'white';
 document.body.appendChild(container);
 
 // Container used to store all fake canvases added via addFakeCanvas operation
@@ -41,7 +45,7 @@ setupHTML();
 
 const {canvas: expectedCanvas, ctx: expectedCtx} = createCanvas();
 const {canvas: diffCanvas, ctx: diffCtx} = createCanvas();
-const {canvas: terrainDepthCanvas, ctx: terrainDepthCtx} = createCanvas();
+const {canvas: actualCanvas, ctx: actualCtx} = createCanvas();
 let map;
 
 tape.onFinish(() => {
@@ -49,24 +53,44 @@ tape.onFinish(() => {
     mapboxgl.clearPrewarmedResources();
 });
 
-for (const testName in fixtures) {
-    tape(testName, {timeout: 20000}, ensureTeardown);
+let osIgnore;
+let timeout = 30000;
+
+if (process.env.CI) {
+    // On CI, MacOS and Windows run on virtual machines.
+    // Windows runs are especially slow so we increase the timeout.
+    const os = navigator.appVersion;
+    if (os.includes("Macintosh")) {
+        osIgnore = ignoreMac;
+    } else if (os.includes("Linux")) {
+        osIgnore = null;
+    } else if (os.includes("Windows")) {
+        osIgnore = ignoreWindows;
+        timeout = 150000; // 2:30
+    } else { console.warn("Unrecognized OS:", os); }
 }
 
-function ensureTeardown(t) {
-    const testName = t.name;
-    const options = {timeout: 5000};
-    if (testName in ignores) {
-        const ignoreType = ignores[testName];
-        if (/^skip/.test(ignoreType)) {
-            options.skip = true;
-        } else {
-            options.todo = true;
-        }
+function checkIgnore(ignoreConfig, testName, options) {
+    if (ignoreConfig.skip.includes(testName)) {
+        options.skip = true;
+    } else if (ignoreConfig.todo.includes(testName)) {
+        options.todo = true;
     }
+}
 
-    t.test(testName, options, runTest);
+for (const testName in fixtures) {
+    const options = {timeout};
+    checkIgnore(ignores, testName, options);
+    if (osIgnore) {
+        checkIgnore(osIgnore, testName, options);
+    }
+    if (navigator.userAgent.includes("Firefox")) {
+        checkIgnore(ignoreFirefox, testName, options);
+    }
+    tape(testName, options, runTest);
+}
 
+function ensureTeardown() {
     //Teardown all global resources
     //Cleanup WebGL context and map
     if (map) {
@@ -75,8 +99,6 @@ function ensureTeardown(t) {
         map = null;
     }
     mapboxgl.clearStorage();
-    expectedCtx.clearRect(0, 0, expectedCanvas.width, expectedCanvas.height);
-    diffCtx.clearRect(0, 0, diffCanvas.width, diffCanvas.height);
 
     //Cleanup canvases added if any
     while (fakeCanvasContainer.firstChild) {
@@ -85,197 +107,241 @@ function ensureTeardown(t) {
 
     //Restore timers
     mapboxgl.restoreNow();
-    t.end();
+}
+
+function parseStyle(currentFixture) {
+    const style = currentFixture.style;
+    if (!style) {
+        throw new Error('style.json is missing');
+    }
+
+    if (style.PARSE_ERROR) {
+        throw new Error(`Error occured while parsing style.json: ${style.message}`);
+    }
+
+    return style;
+}
+
+function parseOptions(currentFixture, style) {
+    const options = {
+        width: 512,
+        height: 512,
+        pixelRatio: 1,
+        allowed: 0.00015,
+        ...((style.metadata && style.metadata.test) || {})
+    };
+
+    return options;
+}
+
+async function setupLayout(options) {
+    window.devicePixelRatio = options.pixelRatio;
+    container.style.width = `${options.width}px`;
+    container.style.height = `${options.height}px`;
+
+    if (options.addFakeCanvas) {
+        const {canvas, ctx} = createCanvas(options.addFakeCanvas.id);
+        const src = options.addFakeCanvas.image.replace('./', '');
+        await drawImage(canvas, ctx, src, false);
+        fakeCanvasContainer.appendChild(canvas);
+    }
+}
+
+async function getExpectedImages(currentTestName) {
+    const currentFixture = fixtures[currentTestName];
+
+    // there may be multiple expected images, covering different platforms
+    const expectedPaths = [];
+    for (const prop in currentFixture) {
+        if (prop.indexOf('expected') > -1) {
+            let path = `${currentTestName}/${prop}.png`;
+            // regression tests with # in the name need to be sanitized
+            path = encodeURIComponent(path);
+            expectedPaths.push(path);
+        }
+    }
+
+    // if we have multiple expected images, we'll compare against each one and pick the one with
+    // the least amount of difference; this is useful for covering features that render differently
+    // depending on platform, i.e. heatmaps use half-float textures for improved rendering where supported
+    const expectedImages = await Promise.all(expectedPaths.map((path) => drawImage(expectedCanvas, expectedCtx, path)));
+
+    if (!process.env.UPDATE && expectedImages.length === 0) {
+        throw new Error('No expected*.png files found; did you mean to run tests with UPDATE=true?');
+    }
+
+    return expectedImages;
+}
+
+async function renderMap(style, options) {
+    mapboxgl.accessToken = 'pk.eyJ1IjoibWFwYm94LWdsLWpzIiwiYSI6ImNram9ybGI1ajExYjQyeGxlemppb2pwYjIifQ.LGy5UGNIsXUZdYMvfYRiAQ';
+    map = new mapboxgl.Map({
+        container,
+        style,
+        classes: options.classes,
+        interactive: false,
+        attributionControl: false,
+        preserveDrawingBuffer: true,
+        axonometric: options.axonometric || false,
+        skew: options.skew || [0, 0],
+        fadeDuration: options.fadeDuration || 0,
+        optimizeForTerrain: options.optimizeForTerrain || false,
+        localIdeographFontFamily: options.localIdeographFontFamily || false,
+        projection: options.projection,
+        crossSourceCollisions: typeof options.crossSourceCollisions === "undefined" ? true : options.crossSourceCollisions,
+        performanceMetricsCollection: false,
+        transformRequest: (url, resourceType) => {
+            // some tests have the port hardcoded to 2900
+            // this makes that backwards compatible
+            if (resourceType === 'Tile') {
+                const transformedUrl = new URL(url);
+                transformedUrl.port = '7357';
+                return {
+                    url: transformedUrl.toString()
+                };
+            }
+        }
+    });
+
+    map._authenticate = () => {};
+
+    // override internal timing to enable precise wait operations
+    window._renderTestNow = 0;
+    mapboxgl.setNow(window._renderTestNow);
+
+    if (options.debug) map.showTileBoundaries = true;
+    if (options.showOverdrawInspector) map.showOverdrawInspector = true;
+    if (options.showTerrainWireframe) map.showTerrainWireframe = true;
+    if (options.showPadding) map.showPadding = true;
+    if (options.collisionDebug) map.showCollisionBoxes = true;
+    if (options.fadeDuration) map._isInitialLoad = false;
+
+    // Disable anisotropic filtering on render tests
+    map.painter.context.extTextureFilterAnisotropicForceOff = true;
+    // Disable globe antialiasing on render tests expect for antialiasing test
+    map.painter.context.extStandardDerivativesForceOff = !options.standardDerivatives;
+
+    map.repaint = true;
+    await map.once('load');
+
+    // Disable vertex morphing by default
+    if (map.painter.terrain) {
+        map.painter.terrain.useVertexMorphing = false;
+    }
+
+    // 3. Run the operations on the map
+    await applyOperations(map, options);
+
+    // 4. Wait until the map is idle
+    map.repaint = true;
+    await new Promise(resolve => map._requestDomTask(resolve));
+
+    return map;
+}
+
+function getViewportSize(map) {
+    const gl = map.painter.context.gl;
+    const viewport = gl.getParameter(gl.VIEWPORT);
+    const w = viewport[2];
+    const h = viewport[3];
+    return {w, h};
+}
+
+function getActualImageData(map, {w, h}, options) {
+    const gl = map.painter.context.gl;
+
+    // 1. get pixel data from test canvas as Uint8Array
+    if (options.output === "terrainDepth") {
+        const pixels = drawTerrainDepth(map, w, h);
+        if (!pixels) {
+            throw new Error('Failed to render terrain depth, make sure that terrain is enabled on the render test');
+        }
+        return Uint8ClampedArray.from(pixels);
+    }
+
+    actualCanvas.width = w;
+    actualCanvas.height = h;
+    actualCtx.drawImage(map.getCanvas(), 0, 0);
+    return actualCtx.getImageData(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight).data;
+}
+
+function getActualImageDataURL(actualImageData, map, {w, h}, options) {
+    if (options.output === "terrainDepth") {
+        actualCanvas.width = w;
+        actualCanvas.height = h;
+        const terrainDepthData = new ImageData(actualImageData, w, h);
+        actualCtx.putImageData(terrainDepthData, 0, 0);
+        return actualCanvas.toDataURL();
+    }
+
+    return map.getCanvas().toDataURL();
+}
+
+function calculateDiff(map, {w, h}, actualImageData, expectedImages) {
+    // 2. draw expected.png into a canvas and extract ImageData
+    let minDiffImage;
+    let minExpectedCanvas;
+    let minDiff = Infinity;
+
+    for (let i = 0; i < expectedImages.length; i++) {
+        // 3. set up Uint8ClampedArray to write diff into
+        const diffImage = new Uint8ClampedArray(w * h * 4);
+
+        // 4. Use pixelmatch to compare actual and expected images and write diff
+        // all inputs must be Uint8Array or Uint8ClampedArray
+        const currentDiff = pixelmatch(actualImageData, expectedImages[i].data, diffImage, w, h, {threshold: 0.1285}) / (w * h);
+
+        if (currentDiff < minDiff) {
+            minDiff = currentDiff;
+            minDiffImage = diffImage;
+            minExpectedCanvas = expectedCanvas;
+        }
+    }
+
+    return {minDiff, minDiffImage, minExpectedCanvas};
 }
 
 async function runTest(t) {
-    let style, options;
+    t.teardown(ensureTeardown);
+
     // This needs to be read from the `t` object because this function runs async in a closure.
     const currentTestName = t.name;
     const writeFileBasePath = `test/integration/${currentTestName}`;
     const currentFixture = fixtures[currentTestName];
     try {
-        style = currentFixture.style;
-        if (!style) {
-            throw new Error('style.json is missing');
-        }
+        const expectedImages = await getExpectedImages(currentTestName);
 
-        if (style.PARSE_ERROR) {
-            throw new Error(`Error occured while parsing style.json: ${style.message}`);
-        }
-
-        options = style.metadata.test;
-
-        // there may be multiple expected images, covering different platforms
-        const expectedPaths = [];
-        for (const prop in currentFixture) {
-            if (prop.indexOf('expected') > -1) {
-                let path = `${currentTestName}/${prop}.png`;
-                // regression tests with # in the name need to be sanitized
-                path = encodeURIComponent(path);
-                expectedPaths.push(path);
-            }
-        }
-
-        const expectedImagePromises = Promise.all(expectedPaths.map((path) => drawImage(expectedCanvas, expectedCtx, path)));
-
-        window.devicePixelRatio = options.pixelRatio;
-
-        if (options.addFakeCanvas) {
-            const {canvas, ctx} = createCanvas(options.addFakeCanvas.id);
-            const src = options.addFakeCanvas.image.replace('./', '');
-            await drawImage(canvas, ctx, src, false);
-            fakeCanvasContainer.appendChild(canvas);
-        }
-
-        container.style.width = `${options.width}px`;
-        container.style.height = `${options.height}px`;
+        const style = parseStyle(currentFixture);
+        const options = parseOptions(currentFixture, style);
+        await setupLayout(options);
 
         //2. Initialize the Map
-        mapboxgl.accessToken = 'pk.eyJ1IjoibWFwYm94LWdsLWpzIiwiYSI6ImNram9ybGI1ajExYjQyeGxlemppb2pwYjIifQ.LGy5UGNIsXUZdYMvfYRiAQ';
-        map = new mapboxgl.Map({
-            container,
-            style,
-            classes: options.classes,
-            interactive: false,
-            attributionControl: false,
-            preserveDrawingBuffer: true,
-            axonometric: options.axonometric || false,
-            skew: options.skew || [0, 0],
-            fadeDuration: options.fadeDuration || 0,
-            optimizeForTerrain: options.optimizeForTerrain || false,
-            localIdeographFontFamily: options.localIdeographFontFamily || false,
-            projection: options.projection,
-            crossSourceCollisions: typeof options.crossSourceCollisions === "undefined" ? true : options.crossSourceCollisions,
-            transformRequest: (url, resourceType) => {
-                // some tests have the port hardcoded to 2900
-                // this makes that backwards compatible
-                if (resourceType === 'Tile') {
-                    const transformedUrl = new URL(url);
-                    transformedUrl.port = '7357';
-                    return {
-                        url: transformedUrl.toString()
-                    };
-                }
-            }
-        });
-
-        map.repaint = true;
-
-        // override internal timing to enable precise wait operations
-        window._renderTestNow = 0;
-        mapboxgl.setNow(window._renderTestNow);
-
-        if (options.debug) map.showTileBoundaries = true;
-        if (options.showOverdrawInspector) map.showOverdrawInspector = true;
-        if (options.showTerrainWireframe) map.showTerrainWireframe = true;
-        if (options.showPadding) map.showPadding = true;
-        if (options.collisionDebug) map.showCollisionBoxes = true;
-        if (options.fadeDuration) map._isInitialLoad = false;
-
-        // Disable anisotropic filtering on render tests
-        map.painter.context.extTextureFilterAnisotropicForceOff = true;
-        // Disable globe antialiasing on render tests expect for antialiasing test
-        map.painter.context.extStandardDerivativesForceOff = !options.standardDerivatives;
-
-        const gl = map.painter.context.gl;
-        await map.once('load');
-        // Disable vertex morphing by default
-        if (map.painter.terrain) {
-            map.painter.terrain.useVertexMorphing = false;
-        }
-
-        //3. Run the operations on the map
-        await applyOperations(map, options);
-        map.repaint = false;
-        const viewport = gl.getParameter(gl.VIEWPORT);
-        const w = viewport[2];
-        const h = viewport[3];
-        let actualImageData;
-
-        // 1. get pixel data from test canvas as Uint8Array
-        if (options.output === "terrainDepth") {
-            const pixels = drawTerrainDepth(map, w, h);
-            if (!pixels) {
-                throw new Error('Failed to render terrain depth, make sure that terrain is enabled on the render test');
-            }
-            actualImageData = Uint8ClampedArray.from(pixels);
-        } else {
-            actualImageData = new Uint8Array(gl.drawingBufferWidth * gl.drawingBufferHeight * 4);
-            gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, actualImageData);
-
-            // readPixels premultiplies the alpha channel so we need to
-            // undo that for comparison with the expected image pixels
-            for (let i = 0; i < actualImageData.length; i += 4) {
-                const alpha = actualImageData[i + 3] / 255;
-                actualImageData[i + 0] /= alpha;
-                actualImageData[i + 1] /= alpha;
-                actualImageData[i + 2] /= alpha;
-            }
-
-            // readPixels starts at the bottom of the canvas
-            // so we need to flip the image data
-            const stride = w * 4;
-            const temp = new Uint8Array(w * 4);
-            for (let i = 0; i < (h / 2 | 0); ++i) {
-                const topOffset = i * stride;
-                const bottomOffset = (h - i - 1) * stride;
-                temp.set(actualImageData.subarray(topOffset, topOffset + stride));
-                actualImageData.copyWithin(topOffset, bottomOffset, bottomOffset + stride);
-                actualImageData.set(temp, bottomOffset);
-            }
-        }
-
-        // if we have multiple expected images, we'll compare against each one and pick the one with
-        // the least amount of difference; this is useful for covering features that render differently
-        // depending on platform, i.e. heatmaps use half-float textures for improved rendering where supported
-        const expectedImages = await expectedImagePromises;
-
-        if (!process.env.UPDATE && expectedImages.length === 0) {
-            throw new Error('No expected*.png files found; did you mean to run tests with UPDATE=true?');
-        }
-
-        let fileInfo;
-        let actual;
-
-        if (options.output === "terrainDepth") {
-            terrainDepthCanvas.width = w;
-            terrainDepthCanvas.height = h;
-            const terrainDepthData = new ImageData(actualImageData, w, h);
-            terrainDepthCtx.putImageData(terrainDepthData, 0, 0);
-            actual = terrainDepthCanvas.toDataURL();
-        } else {
-            actual = map.getCanvas().toDataURL();
-        }
+        map = await renderMap(style, options);
+        const {w, h} = getViewportSize(map);
+        const actualImageData = getActualImageData(map, {w, h}, options);
 
         if (process.env.UPDATE) {
-            fileInfo = [
-                {
-                    path: `${writeFileBasePath}/expected.png`,
-                    data: actual.split(',')[1]
-                }
-            ];
-        } else {
-            // 2. draw expected.png into a canvas and extract ImageData
-            let minDiffImage;
-            let minExpectedCanvas;
-            let minDiff = Infinity;
+            browserWriteFile.postMessage([{
+                path: `${writeFileBasePath}/expected.png`,
+                data: getActualImageDataURL(actualImageData, map, {w, h}, options).split(',')[1]
+            }]);
 
-            for (let i = 0; i < expectedImages.length; i++) {
-                // 3. set up Uint8ClampedArray to write diff into
-                const diffImage = new Uint8ClampedArray(w * h * 4);
+            return;
+        }
 
-                // 4. Use pixelmatch to compare actual and expected images and write diff
-                // all inputs must be Uint8Array or Uint8ClampedArray
-                const currentDiff = pixelmatch(actualImageData, expectedImages[i].data, diffImage, w, h, {threshold: 0.1285}) / (w * h);
+        const {minDiff, minDiffImage, minExpectedCanvas} = calculateDiff(map, {w, h}, actualImageData, expectedImages);
+        const pass = minDiff <= options.allowed;
+        const testMetaData = {
+            name: currentTestName,
+            minDiff: Math.round(100000 * minDiff) / 100000,
+            status: t._todo ? 'todo' : pass ? 'passed' : 'failed',
+            style: map.getStyle(),
+        };
 
-                if (currentDiff < minDiff) {
-                    minDiff = currentDiff;
-                    minDiffImage = diffImage;
-                    minExpectedCanvas = expectedCanvas;
-                }
-            }
+        t.ok(pass || t._todo, t.name);
 
+        // only display results locally, or on CI if it's failing
+        if (!process.env.CI || !pass) {
             // 5. Convert diff Uint8Array to ImageData and write to canvas
             // so we can get a base64 string to display the diff in the browser
             diffCanvas.width = w;
@@ -283,44 +349,34 @@ async function runTest(t) {
             const diffImageData = new ImageData(minDiffImage, w, h);
             diffCtx.putImageData(diffImageData, 0, 0);
 
-            const expected = minExpectedCanvas.toDataURL();
+            const actual = getActualImageDataURL(actualImageData, map, {w, h}, options);
             const imgDiff = diffCanvas.toDataURL();
 
             // 6. use browserWriteFile to write actual and diff to disk (convert image back to base64)
-            fileInfo = [
-                {
-                    path: `${writeFileBasePath}/actual.png`,
-                    data: actual.split(',')[1]
-                },
-                {
-                    path: `${writeFileBasePath}/diff.png`,
-                    data: imgDiff.split(',')[1]
-                }
-            ];
+            if (!process.env.CI) {
+                browserWriteFile.postMessage([
+                    {
+                        path: `${writeFileBasePath}/actual.png`,
+                        data: actual.split(',')[1]
+                    },
+                    {
+                        path: `${writeFileBasePath}/diff.png`,
+                        data: imgDiff.split(',')[1]
+                    }
+                ]);
+            }
 
-            // 7. pass image paths to testMetaData so the UI can load them from disk
-            const testMetaData = {
-                name: currentTestName,
-                actual,
-                expected,
-                imgDiff,
-                minDiff: minDiff.toFixed(5)
-            };
-
-            const pass = minDiff <= options.allowed;
-            t.ok(pass || t._todo, t.name);
-            testMetaData.status = t._todo ? 'todo' : pass ? 'passed' : 'failed';
-            updateHTML(testMetaData);
+            // 7. pass image paths to testMetaData so the UI can render them
+            testMetaData.actual = actual;
+            testMetaData.expected = minExpectedCanvas.toDataURL();
+            testMetaData.imgDiff = imgDiff;
         }
 
-        if (!process.env.CI || process.env.UPDATE) browserWriteFile.postMessage(fileInfo);
-
+        updateHTML(testMetaData);
     } catch (e) {
         t.error(e);
         updateHTML({name: t.name, status:'failed', jsonDiff: e.message});
     }
-
-    t.end();
 }
 
 function drawImage(canvas, ctx, src, getImageData = true) {
@@ -350,7 +406,7 @@ function drawImage(canvas, ctx, src, getImageData = true) {
 function createCanvas(id = 'fake-canvas') {
     const canvas = window.document.createElement('canvas');
     canvas.id = id;
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', {willReadFrequently: true});
     return {canvas, ctx};
 }
 
